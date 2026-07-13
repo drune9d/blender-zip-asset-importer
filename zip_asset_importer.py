@@ -1,22 +1,24 @@
 bl_info = {
     "name": "ZIP Asset Importer",
     "author": "Drune",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > ZIP Import",
-    "description": "Extract a model ZIP, import the best supported 3D file, and build a Node Wrangler-style PBR material",
+    "description": "Extract a model ZIP (or batch-import a folder tree of FBX/glTF assets), import the best supported 3D file, and build a Node Wrangler-style PBR material",
     "category": "Import-Export",
 }
 
 import os
+from collections import deque
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import time
 import zipfile
 
 import bpy
-from bpy.props import BoolProperty, StringProperty
-from bpy.types import Operator, Panel
+from bpy.props import BoolProperty, CollectionProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector
 
 
@@ -37,6 +39,8 @@ MODEL_EXTENSIONS = {
     ".x3d": 50,
     ".wrl": 48,
 }
+
+BATCH_MODEL_EXTENSIONS = {".fbx", ".glb", ".gltf"}
 
 IMAGE_EXTENSIONS = {
     ".bmp",
@@ -650,6 +654,257 @@ def _select_objects(objects):
     bpy.context.view_layer.objects.active = active
 
 
+_BATCH_STEP_INTERVAL = 0.0  # reschedule ASAP; still yields to Blender's UI loop between assets
+_BATCH_ORPHAN_PURGE_INTERVAL = 25  # reclaim memory from failed/partial imports periodically
+
+_batch_run = {
+    "queue": deque(),
+    "root": None,
+}
+
+
+def _scan_batch_assets(root):
+    ignored_parts = {"__macosx", ".git"}
+    found = []
+    scan_errors = []
+
+    def on_error(os_err):
+        scan_errors.append(str(os_err))
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=on_error):
+        dirnames[:] = [d for d in dirnames if d.lower() not in ignored_parts]
+        for filename in filenames:
+            if Path(filename).suffix.lower() in BATCH_MODEL_EXTENSIONS:
+                found.append(Path(dirpath) / filename)
+
+    found.sort(key=lambda path: str(path).lower())
+    return found, scan_errors
+
+
+def _process_one_batch_asset(scene, model_path):
+    before_objects = set(bpy.data.objects)
+    try:
+        imported_objects = _call_importer(model_path)
+        if not imported_objects:
+            raise RuntimeError("Importer produced no objects")
+
+        mesh_objects = _mesh_objects_from(imported_objects)
+        image_paths = _find_files(model_path.parent, IMAGE_EXTENSIONS)
+        texture_matches = _classify_textures(image_paths)
+        if mesh_objects and texture_matches:
+            material = _create_node_wrangler_style_material(
+                f"{model_path.stem}_PBR",
+                texture_matches,
+                scene.zip_asset_importer_use_ao_cavity,
+            )
+            _apply_material(mesh_objects, material, scene.zip_asset_importer_replace_materials)
+
+        if scene.zip_asset_importer_shade_smooth:
+            _shade_smooth(mesh_objects)
+    except Exception:
+        # A failed asset must not leave partial data behind, so remove whatever
+        # this attempt created before re-raising for the caller to log and skip.
+        for obj in set(bpy.data.objects) - before_objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        raise
+
+
+def _tag_redraw_all():
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            area.tag_redraw()
+
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:d}:{seconds:02d}"
+
+
+def _estimate_remaining(state):
+    if state.processed <= 0 or state.total <= 0:
+        return "estimating..."
+    rate = state.elapsed / state.processed
+    return _format_duration(rate * max(0, state.total - state.processed))
+
+
+def _batch_timer_step():
+    # Outer guard: a bug here must still leave the UI in a clean, restartable
+    # state rather than a "running" panel with a dead timer behind it.
+    try:
+        return _batch_timer_step_body()
+    except Exception as exc:
+        state = bpy.context.window_manager.zip_asset_importer_batch
+        entry = state.errors.add()
+        entry.filename = "(batch)"
+        entry.message = f"Batch stopped unexpectedly: {exc}"
+        state.is_running = False
+        state.finished = True
+        state.current_file = ""
+        _batch_run["queue"].clear()
+        _tag_redraw_all()
+        return None
+
+
+def _batch_timer_step_body():
+    state = bpy.context.window_manager.zip_asset_importer_batch
+    queue = _batch_run["queue"]
+
+    if state.cancel_requested or not queue:
+        state.cancelled = bool(state.cancel_requested and queue)
+        queue.clear()
+        state.is_running = False
+        state.finished = True
+        state.current_file = ""
+        state.elapsed = time.time() - state.start_time
+        _tag_redraw_all()
+        return None
+
+    model_path = queue.popleft()
+    root = _batch_run["root"]
+    try:
+        display_name = str(model_path.relative_to(root))
+    except ValueError:
+        display_name = model_path.name
+    state.current_file = display_name
+
+    try:
+        _process_one_batch_asset(bpy.context.scene, model_path)
+        state.succeeded += 1
+    except Exception as exc:
+        state.failed += 1
+        entry = state.errors.add()
+        entry.filename = display_name
+        entry.message = str(exc)[:255]
+
+    state.processed += 1
+    if state.processed % _BATCH_ORPHAN_PURGE_INTERVAL == 0:
+        try:
+            bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=False, do_recursive=True)
+        except Exception:
+            pass
+
+    state.elapsed = time.time() - state.start_time
+    _tag_redraw_all()
+    return _BATCH_STEP_INTERVAL
+
+
+class ZIPASSETIMPORTER_PG_batch_error(PropertyGroup):
+    filename: StringProperty(name="Filename")
+    message: StringProperty(name="Message")
+
+
+class ZIPASSETIMPORTER_PG_batch_state(PropertyGroup):
+    is_running: BoolProperty(default=False)
+    cancel_requested: BoolProperty(default=False)
+    finished: BoolProperty(default=False)
+    cancelled: BoolProperty(default=False)
+    total: IntProperty(default=0)
+    processed: IntProperty(default=0)
+    succeeded: IntProperty(default=0)
+    failed: IntProperty(default=0)
+    current_file: StringProperty(default="")
+    start_time: FloatProperty(default=0.0)
+    elapsed: FloatProperty(default=0.0)
+    show_errors: BoolProperty(default=False)
+    errors: CollectionProperty(type=ZIPASSETIMPORTER_PG_batch_error)
+
+
+class ZIPASSETIMPORTER_OT_batch_import(Operator):
+    bl_idname = "zip_asset_importer.batch_import"
+    bl_label = "Start Batch Import"
+    bl_description = (
+        "Recursively scan the root folder for .fbx/.glb/.gltf assets and import them one at a time, "
+        "applying the same material setup as a single ZIP import"
+    )
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        scene = context.scene
+        wm = context.window_manager
+        state = wm.zip_asset_importer_batch
+
+        if state.is_running:
+            self.report({"WARNING"}, "A batch import is already running")
+            return {"CANCELLED"}
+
+        root = bpy.path.abspath(scene.zip_asset_importer_batch_root)
+        if not root or not os.path.isdir(root):
+            self.report({"ERROR"}, "Choose a valid root folder")
+            return {"CANCELLED"}
+
+        found, scan_errors = _scan_batch_assets(root)
+        if not found:
+            self.report({"WARNING"}, "No supported assets (.fbx/.glb/.gltf) found under the selected folder")
+            return {"CANCELLED"}
+
+        active_object = context.view_layer.objects.active if context.view_layer else None
+        if active_object is not None and active_object.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+
+        state.errors.clear()
+        for message in scan_errors:
+            entry = state.errors.add()
+            entry.filename = "(scan)"
+            entry.message = message
+
+        state.is_running = True
+        state.finished = False
+        state.cancelled = False
+        state.cancel_requested = False
+        state.total = len(found)
+        state.processed = 0
+        state.succeeded = 0
+        state.failed = 0
+        state.current_file = ""
+        state.start_time = time.time()
+        state.elapsed = 0.0
+
+        _batch_run["root"] = Path(root)
+        _batch_run["queue"] = deque(found)
+
+        bpy.app.timers.register(_batch_timer_step, first_interval=0.0)
+        _tag_redraw_all()
+
+        self.report({"INFO"}, f"Batch import started: {len(found)} asset(s) queued")
+        return {"FINISHED"}
+
+
+class ZIPASSETIMPORTER_OT_batch_cancel(Operator):
+    bl_idname = "zip_asset_importer.batch_cancel"
+    bl_label = "Stop Batch Import"
+    bl_description = "Finish the asset currently being processed, then stop the batch cleanly"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        context.window_manager.zip_asset_importer_batch.cancel_requested = True
+        return {"FINISHED"}
+
+
+class ZIPASSETIMPORTER_OT_batch_dismiss(Operator):
+    bl_idname = "zip_asset_importer.batch_dismiss"
+    bl_label = "Dismiss Summary"
+    bl_description = "Clear the last batch import summary"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        state = context.window_manager.zip_asset_importer_batch
+        state.finished = False
+        state.cancelled = False
+        state.errors.clear()
+        state.total = 0
+        state.processed = 0
+        state.succeeded = 0
+        state.failed = 0
+        return {"FINISHED"}
+
+
 class ZIPASSETIMPORTER_OT_import_zip(Operator):
     bl_idname = "zip_asset_importer.import_zip"
     bl_label = "Import ZIP Asset"
@@ -762,9 +1017,86 @@ class ZIPASSETIMPORTER_PT_panel(Panel):
 
         layout.operator("zip_asset_importer.import_zip", icon="IMPORT")
 
+        layout.separator()
+        self._draw_batch_section(layout, context)
+
+    def _draw_batch_section(self, layout, context):
+        scene = context.scene
+        state = context.window_manager.zip_asset_importer_batch
+
+        box = layout.box()
+        box.label(text="Batch Import (Folder)", icon="FILE_FOLDER")
+        box.prop(scene, "zip_asset_importer_batch_root", text="Root Folder")
+
+        if state.is_running:
+            factor = (state.processed / state.total) if state.total else 0.0
+            self._draw_progress_bar(box, factor, f"{state.processed}/{state.total} processed")
+
+            col = box.column(align=True)
+            col.label(text=f"Current: {state.current_file or '...'}")
+            col.label(text=f"Elapsed {_format_duration(state.elapsed)}  ·  ETA {_estimate_remaining(state)}")
+
+            cancel_row = box.row()
+            cancel_row.alert = True
+            cancel_row.scale_y = 1.3
+            cancel_row.operator("zip_asset_importer.batch_cancel", icon="CANCEL", text="Stop Batch Import")
+        else:
+            row = box.row()
+            row.enabled = bool(scene.zip_asset_importer_batch_root)
+            row.operator("zip_asset_importer.batch_import", icon="PLAY", text="Start Batch Import")
+
+        if state.finished:
+            self._draw_batch_summary(box, state)
+
+    @staticmethod
+    def _draw_progress_bar(layout, factor, text):
+        factor = max(0.0, min(1.0, factor))
+        if hasattr(layout, "progress"):
+            layout.progress(factor=factor, text=text)
+            return
+        row = layout.row(align=True)
+        split = row.split(factor=factor if factor > 0.0 else 0.001, align=True)
+        filled = split.row(align=True)
+        filled.alert = True
+        filled.label(text="")
+        if factor < 1.0:
+            split.row(align=True).label(text="")
+        layout.label(text=text)
+
+    @staticmethod
+    def _draw_batch_summary(layout, state):
+        summary = layout.box()
+        if state.cancelled:
+            summary.label(text="Batch Cancelled", icon="CANCEL")
+        else:
+            summary.label(text="Batch Complete", icon="CHECKMARK")
+        summary.label(text=f"Discovered: {state.total}")
+        summary.label(text=f"Succeeded: {state.succeeded}")
+        summary.label(text=f"Failed: {state.failed}")
+        if state.cancelled:
+            summary.label(text=f"Not processed: {state.total - state.processed}")
+        summary.label(text=f"Total time: {_format_duration(state.elapsed)}")
+
+        if len(state.errors):
+            summary.prop(state, "show_errors", text=f"Show Issues ({len(state.errors)})", toggle=True)
+            if state.show_errors:
+                issues = summary.box()
+                shown = list(state.errors)[:50]
+                for entry in shown:
+                    issues.label(text=f"{entry.filename}: {entry.message}")
+                if len(state.errors) > 50:
+                    issues.label(text=f"... and {len(state.errors) - 50} more")
+
+        summary.operator("zip_asset_importer.batch_dismiss", text="Dismiss")
+
 
 classes = (
+    ZIPASSETIMPORTER_PG_batch_error,
+    ZIPASSETIMPORTER_PG_batch_state,
     ZIPASSETIMPORTER_OT_import_zip,
+    ZIPASSETIMPORTER_OT_batch_import,
+    ZIPASSETIMPORTER_OT_batch_cancel,
+    ZIPASSETIMPORTER_OT_batch_dismiss,
     ZIPASSETIMPORTER_PT_panel,
 )
 
@@ -804,9 +1136,24 @@ def register():
         description="Frame the imported model in the active 3D View",
         default=True,
     )
+    bpy.types.Scene.zip_asset_importer_batch_root = StringProperty(
+        name="Batch Root Folder",
+        description="Root folder to scan recursively for .fbx/.glb/.gltf assets",
+        subtype="DIR_PATH",
+        default="",
+    )
+
+    bpy.types.WindowManager.zip_asset_importer_batch = PointerProperty(type=ZIPASSETIMPORTER_PG_batch_state)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_batch_timer_step):
+        bpy.app.timers.unregister(_batch_timer_step)
+    _batch_run["queue"].clear()
+
+    if hasattr(bpy.types.WindowManager, "zip_asset_importer_batch"):
+        del bpy.types.WindowManager.zip_asset_importer_batch
+
     for prop_name in (
         "zip_asset_importer_zip_path",
         "zip_asset_importer_import_all_models",
@@ -814,6 +1161,7 @@ def unregister():
         "zip_asset_importer_use_ao_cavity",
         "zip_asset_importer_shade_smooth",
         "zip_asset_importer_focus_view",
+        "zip_asset_importer_batch_root",
     ):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)
