@@ -660,6 +660,9 @@ _BATCH_ORPHAN_PURGE_INTERVAL = 25  # reclaim memory from failed/partial imports 
 _batch_run = {
     "queue": deque(),
     "root": None,
+    "layout_cursor_x": 0.0,
+    "layout_cursor_y": 0.0,
+    "layout_row_depth": 0.0,
 }
 
 
@@ -679,6 +682,59 @@ def _scan_batch_assets(root):
 
     found.sort(key=lambda path: str(path).lower())
     return found, scan_errors
+
+
+def _world_bounds(mesh_objects):
+    min_v = Vector((float("inf"), float("inf"), float("inf")))
+    max_v = Vector((float("-inf"), float("-inf"), float("-inf")))
+    found = False
+
+    for obj in mesh_objects:
+        matrix = obj.matrix_world
+        for corner in obj.bound_box:
+            world_corner = matrix @ Vector(corner)
+            min_v.x = min(min_v.x, world_corner.x)
+            min_v.y = min(min_v.y, world_corner.y)
+            min_v.z = min(min_v.z, world_corner.z)
+            max_v.x = max(max_v.x, world_corner.x)
+            max_v.y = max(max_v.y, world_corner.y)
+            max_v.z = max(max_v.z, world_corner.z)
+            found = True
+
+    return (min_v, max_v) if found else None
+
+
+def _apply_auto_layout(imported_objects, mesh_objects, spacing, max_row_width):
+    bounds = _world_bounds(mesh_objects)
+    if bounds is None:
+        return
+    min_v, max_v = bounds
+    width = max_v.x - min_v.x
+    depth = max_v.y - min_v.y
+
+    cursor_x = _batch_run["layout_cursor_x"]
+    cursor_y = _batch_run["layout_cursor_y"]
+    row_depth = _batch_run["layout_row_depth"]
+
+    if cursor_x > 0.0 and (cursor_x + width) > max_row_width:
+        cursor_x = 0.0
+        cursor_y += row_depth + spacing
+        row_depth = 0.0
+
+    # Only X/Y are packed into the grid; each asset keeps its authored height
+    # off the ground plane instead of being snapped to a shared Z.
+    delta = Vector((cursor_x - min_v.x, cursor_y - min_v.y, 0.0))
+
+    imported_set = set(imported_objects)
+    for obj in imported_objects:
+        if obj.parent not in imported_set:
+            world_matrix = obj.matrix_world.copy()
+            world_matrix.translation += delta
+            obj.matrix_world = world_matrix
+
+    _batch_run["layout_cursor_x"] = cursor_x + width + spacing
+    _batch_run["layout_cursor_y"] = cursor_y
+    _batch_run["layout_row_depth"] = max(row_depth, depth)
 
 
 def _process_one_batch_asset(scene, model_path):
@@ -701,6 +757,14 @@ def _process_one_batch_asset(scene, model_path):
 
         if scene.zip_asset_importer_shade_smooth:
             _shade_smooth(mesh_objects)
+
+        if scene.zip_asset_importer_batch_auto_layout:
+            _apply_auto_layout(
+                imported_objects,
+                mesh_objects,
+                scene.zip_asset_importer_batch_layout_spacing,
+                scene.zip_asset_importer_batch_layout_row_width,
+            )
     except Exception:
         # A failed asset must not leave partial data behind, so remove whatever
         # this attempt created before re-raising for the caller to log and skip.
@@ -868,6 +932,9 @@ class ZIPASSETIMPORTER_OT_batch_import(Operator):
 
         _batch_run["root"] = Path(root)
         _batch_run["queue"] = deque(found)
+        _batch_run["layout_cursor_x"] = 0.0
+        _batch_run["layout_cursor_y"] = 0.0
+        _batch_run["layout_row_depth"] = 0.0
 
         bpy.app.timers.register(_batch_timer_step, first_interval=0.0)
         _tag_redraw_all()
@@ -1028,6 +1095,12 @@ class ZIPASSETIMPORTER_PT_panel(Panel):
         box.label(text="Batch Import (Folder)", icon="FILE_FOLDER")
         box.prop(scene, "zip_asset_importer_batch_root", text="Root Folder")
 
+        box.prop(scene, "zip_asset_importer_batch_auto_layout")
+        if scene.zip_asset_importer_batch_auto_layout:
+            layout_row = box.row(align=True)
+            layout_row.prop(scene, "zip_asset_importer_batch_layout_spacing", text="Spacing")
+            layout_row.prop(scene, "zip_asset_importer_batch_layout_row_width", text="Row Width")
+
         if state.is_running:
             factor = (state.processed / state.total) if state.total else 0.0
             self._draw_progress_bar(box, factor, f"{state.processed}/{state.total} processed")
@@ -1142,6 +1215,26 @@ def register():
         subtype="DIR_PATH",
         default="",
     )
+    bpy.types.Scene.zip_asset_importer_batch_auto_layout = BoolProperty(
+        name="Auto-Layout Grid",
+        description="Arrange each imported asset on a spaced-out grid (by footprint) so a batch of "
+        "assets authored at the same origin doesn't end up stacked on top of each other",
+        default=False,
+    )
+    bpy.types.Scene.zip_asset_importer_batch_layout_spacing = FloatProperty(
+        name="Spacing",
+        description="Gap left between adjacent assets in the auto-layout grid",
+        subtype="DISTANCE",
+        default=1.0,
+        min=0.0,
+    )
+    bpy.types.Scene.zip_asset_importer_batch_layout_row_width = FloatProperty(
+        name="Row Width",
+        description="Approximate width before the auto-layout grid wraps to a new row",
+        subtype="DISTANCE",
+        default=20.0,
+        min=0.1,
+    )
 
     bpy.types.WindowManager.zip_asset_importer_batch = PointerProperty(type=ZIPASSETIMPORTER_PG_batch_state)
 
@@ -1162,6 +1255,9 @@ def unregister():
         "zip_asset_importer_shade_smooth",
         "zip_asset_importer_focus_view",
         "zip_asset_importer_batch_root",
+        "zip_asset_importer_batch_auto_layout",
+        "zip_asset_importer_batch_layout_spacing",
+        "zip_asset_importer_batch_layout_row_width",
     ):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)
