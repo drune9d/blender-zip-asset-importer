@@ -1,10 +1,10 @@
 bl_info = {
     "name": "ZIP Asset Importer",
     "author": "Drune",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > ZIP Import",
-    "description": "Extract a model ZIP (or batch-import a folder tree of FBX/glTF assets), import the best supported 3D file, and build a Node Wrangler-style PBR material",
+    "description": "Extract a model ZIP (or batch-import a folder tree of FBX/glTF assets), import the best supported 3D file, build a Node Wrangler-style PBR material, and optionally preview texture-only folders on spheres",
     "category": "Import-Export",
 }
 
@@ -642,6 +642,15 @@ def _shade_smooth(mesh_objects):
             poly.use_smooth = True
 
 
+def _create_material_preview_sphere(name, material):
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(0.0, 0.0, 0.0))
+    obj = bpy.context.view_layer.objects.active
+    obj.name = name
+    obj.data.name = f"{name}_Mesh"
+    obj.data.materials.append(material)
+    return obj
+
+
 def _select_objects(objects):
     bpy.ops.object.select_all(action="DESELECT")
     active = None
@@ -682,6 +691,29 @@ def _scan_batch_assets(root):
 
     found.sort(key=lambda path: str(path).lower())
     return found, scan_errors
+
+
+def _scan_texture_only_folders(root, exclude_dirs):
+    # A folder already covered by a model (at or below the model's own
+    # parent directory) has its textures picked up by that model's own
+    # material build, so it must not also spawn a redundant preview sphere.
+    ignored_parts = {"__macosx", ".git"}
+    exclude_dirs = list(exclude_dirs)
+    found = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in ignored_parts]
+        current = Path(dirpath)
+        if any(current == excluded or excluded in current.parents for excluded in exclude_dirs):
+            continue
+        if any(Path(name).suffix.lower() in MODEL_EXTENSIONS for name in filenames):
+            continue
+        if not any(Path(name).suffix.lower() in IMAGE_EXTENSIONS for name in filenames):
+            continue
+        found.append(current)
+
+    found.sort(key=lambda path: str(path).lower())
+    return found
 
 
 def _world_bounds(mesh_objects):
@@ -737,7 +769,7 @@ def _apply_auto_layout(imported_objects, mesh_objects, spacing, max_row_width):
     _batch_run["layout_row_depth"] = max(row_depth, depth)
 
 
-def _process_one_batch_asset(scene, model_path):
+def _process_one_batch_model(scene, model_path):
     before_objects = set(bpy.data.objects)
     try:
         imported_objects = _call_importer(model_path)
@@ -771,6 +803,50 @@ def _process_one_batch_asset(scene, model_path):
         for obj in set(bpy.data.objects) - before_objects:
             bpy.data.objects.remove(obj, do_unlink=True)
         raise
+
+
+def _process_one_batch_texture_folder(scene, folder_path):
+    before_objects = set(bpy.data.objects)
+    try:
+        image_paths = [
+            path
+            for path in folder_path.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        texture_matches = _classify_textures(image_paths)
+        if not texture_matches:
+            raise RuntimeError("No recognizable texture maps in folder")
+
+        material = _create_node_wrangler_style_material(
+            f"{folder_path.name}_PBR",
+            texture_matches,
+            scene.zip_asset_importer_use_ao_cavity,
+        )
+        sphere = _create_material_preview_sphere(folder_path.name, material)
+
+        if scene.zip_asset_importer_shade_smooth:
+            _shade_smooth([sphere])
+
+        # Unlike an imported model, a fresh sphere has no authored transform to
+        # preserve, so it is always grid-placed regardless of the Auto-Layout
+        # Grid toggle - otherwise every preview sphere would stack at the origin.
+        _apply_auto_layout(
+            [sphere],
+            [sphere],
+            scene.zip_asset_importer_batch_layout_spacing,
+            scene.zip_asset_importer_batch_layout_row_width,
+        )
+    except Exception:
+        for obj in set(bpy.data.objects) - before_objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        raise
+
+
+def _process_one_batch_asset(scene, kind, asset_path):
+    if kind == "texture_folder":
+        _process_one_batch_texture_folder(scene, asset_path)
+    else:
+        _process_one_batch_model(scene, asset_path)
 
 
 def _tag_redraw_all():
@@ -827,16 +903,16 @@ def _batch_timer_step_body():
         _tag_redraw_all()
         return None
 
-    model_path = queue.popleft()
+    kind, asset_path = queue.popleft()
     root = _batch_run["root"]
     try:
-        display_name = str(model_path.relative_to(root))
+        display_name = str(asset_path.relative_to(root))
     except ValueError:
-        display_name = model_path.name
+        display_name = asset_path.name
     state.current_file = display_name
 
     try:
-        _process_one_batch_asset(bpy.context.scene, model_path)
+        _process_one_batch_asset(bpy.context.scene, kind, asset_path)
         state.succeeded += 1
     except Exception as exc:
         state.failed += 1
@@ -901,9 +977,21 @@ class ZIPASSETIMPORTER_OT_batch_import(Operator):
             return {"CANCELLED"}
 
         found, scan_errors = _scan_batch_assets(root)
-        if not found:
-            self.report({"WARNING"}, "No supported assets (.fbx/.glb/.gltf) found under the selected folder")
+
+        texture_folders = []
+        if scene.zip_asset_importer_batch_texture_spheres:
+            texture_folders = _scan_texture_only_folders(root, {path.parent for path in found})
+
+        if not found and not texture_folders:
+            self.report(
+                {"WARNING"},
+                "No supported assets (.fbx/.glb/.gltf) or texture-only folders found under the selected folder",
+            )
             return {"CANCELLED"}
+
+        queue_items = [("model", path) for path in found] + [
+            ("texture_folder", path) for path in texture_folders
+        ]
 
         active_object = context.view_layer.objects.active if context.view_layer else None
         if active_object is not None and active_object.mode != "OBJECT":
@@ -922,7 +1010,7 @@ class ZIPASSETIMPORTER_OT_batch_import(Operator):
         state.finished = False
         state.cancelled = False
         state.cancel_requested = False
-        state.total = len(found)
+        state.total = len(queue_items)
         state.processed = 0
         state.succeeded = 0
         state.failed = 0
@@ -931,7 +1019,7 @@ class ZIPASSETIMPORTER_OT_batch_import(Operator):
         state.elapsed = 0.0
 
         _batch_run["root"] = Path(root)
-        _batch_run["queue"] = deque(found)
+        _batch_run["queue"] = deque(queue_items)
         _batch_run["layout_cursor_x"] = 0.0
         _batch_run["layout_cursor_y"] = 0.0
         _batch_run["layout_row_depth"] = 0.0
@@ -939,7 +1027,11 @@ class ZIPASSETIMPORTER_OT_batch_import(Operator):
         bpy.app.timers.register(_batch_timer_step, first_interval=0.0)
         _tag_redraw_all()
 
-        self.report({"INFO"}, f"Batch import started: {len(found)} asset(s) queued")
+        message = f"Batch import started: {len(found)} model(s)"
+        if scene.zip_asset_importer_batch_texture_spheres:
+            message += f", {len(texture_folders)} texture-only folder(s)"
+        message += " queued"
+        self.report({"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -1096,7 +1188,8 @@ class ZIPASSETIMPORTER_PT_panel(Panel):
         box.prop(scene, "zip_asset_importer_batch_root", text="Root Folder")
 
         box.prop(scene, "zip_asset_importer_batch_auto_layout")
-        if scene.zip_asset_importer_batch_auto_layout:
+        box.prop(scene, "zip_asset_importer_batch_texture_spheres")
+        if scene.zip_asset_importer_batch_auto_layout or scene.zip_asset_importer_batch_texture_spheres:
             layout_row = box.row(align=True)
             layout_row.prop(scene, "zip_asset_importer_batch_layout_spacing", text="Spacing")
             layout_row.prop(scene, "zip_asset_importer_batch_layout_row_width", text="Row Width")
@@ -1221,6 +1314,14 @@ def register():
         "assets authored at the same origin doesn't end up stacked on top of each other",
         default=False,
     )
+    bpy.types.Scene.zip_asset_importer_batch_texture_spheres = BoolProperty(
+        name="Texture-Only Folders → Spheres",
+        description="Also scan for folders that contain texture images but no supported 3D model. For each one, "
+        "build a material from the textures and apply it to a new sphere so you can preview it. These spheres are "
+        "always grid-placed (regardless of the Auto-Layout Grid setting) since they have no authored transform to "
+        "preserve",
+        default=False,
+    )
     bpy.types.Scene.zip_asset_importer_batch_layout_spacing = FloatProperty(
         name="Spacing",
         description="Gap left between adjacent assets in the auto-layout grid",
@@ -1256,6 +1357,7 @@ def unregister():
         "zip_asset_importer_focus_view",
         "zip_asset_importer_batch_root",
         "zip_asset_importer_batch_auto_layout",
+        "zip_asset_importer_batch_texture_spheres",
         "zip_asset_importer_batch_layout_spacing",
         "zip_asset_importer_batch_layout_row_width",
     ):
