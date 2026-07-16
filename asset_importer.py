@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "ZIP Asset Importer",
+    "name": "Asset Importer",
     "author": "Drune",
-    "version": (1, 3, 0),
+    "version": (2, 0, 0),
     "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > ZIP Import",
-    "description": "Extract a model ZIP (or batch-import a folder tree of FBX/glTF assets), import the best supported 3D file, build a Node Wrangler-style PBR material, and optionally preview texture-only folders on spheres",
+    "location": "View3D > Sidebar > Asset Importer",
+    "description": "Import a model ZIP or batch-import a folder tree of FBX/glTF assets, auto-build a Node Wrangler-style PBR material, arrange results on a grid, and preview texture-only folders on spheres",
     "category": "Import-Export",
 }
 
@@ -783,19 +783,19 @@ def _process_one_batch_model(scene, model_path):
             material = _create_node_wrangler_style_material(
                 f"{model_path.stem}_PBR",
                 texture_matches,
-                scene.zip_asset_importer_use_ao_cavity,
+                scene.asset_importer_use_ao_cavity,
             )
-            _apply_material(mesh_objects, material, scene.zip_asset_importer_replace_materials)
+            _apply_material(mesh_objects, material, scene.asset_importer_replace_materials)
 
-        if scene.zip_asset_importer_shade_smooth:
+        if scene.asset_importer_shade_smooth:
             _shade_smooth(mesh_objects)
 
-        if scene.zip_asset_importer_batch_auto_layout:
+        if scene.asset_importer_batch_auto_layout:
             _apply_auto_layout(
                 imported_objects,
                 mesh_objects,
-                scene.zip_asset_importer_batch_layout_spacing,
-                scene.zip_asset_importer_batch_layout_row_width,
+                scene.asset_importer_batch_layout_spacing,
+                scene.asset_importer_batch_layout_row_width,
             )
     except Exception:
         # A failed asset must not leave partial data behind, so remove whatever
@@ -820,11 +820,11 @@ def _process_one_batch_texture_folder(scene, folder_path):
         material = _create_node_wrangler_style_material(
             f"{folder_path.name}_PBR",
             texture_matches,
-            scene.zip_asset_importer_use_ao_cavity,
+            scene.asset_importer_use_ao_cavity,
         )
         sphere = _create_material_preview_sphere(folder_path.name, material)
 
-        if scene.zip_asset_importer_shade_smooth:
+        if scene.asset_importer_shade_smooth:
             _shade_smooth([sphere])
 
         # Unlike an imported model, a fresh sphere has no authored transform to
@@ -833,8 +833,8 @@ def _process_one_batch_texture_folder(scene, folder_path):
         _apply_auto_layout(
             [sphere],
             [sphere],
-            scene.zip_asset_importer_batch_layout_spacing,
-            scene.zip_asset_importer_batch_layout_row_width,
+            scene.asset_importer_batch_layout_spacing,
+            scene.asset_importer_batch_layout_row_width,
         )
     except Exception:
         for obj in set(bpy.data.objects) - before_objects:
@@ -877,7 +877,7 @@ def _batch_timer_step():
     try:
         return _batch_timer_step_body()
     except Exception as exc:
-        state = bpy.context.window_manager.zip_asset_importer_batch
+        state = bpy.context.window_manager.asset_importer_batch
         entry = state.errors.add()
         entry.filename = "(batch)"
         entry.message = f"Batch stopped unexpectedly: {exc}"
@@ -890,7 +890,7 @@ def _batch_timer_step():
 
 
 def _batch_timer_step_body():
-    state = bpy.context.window_manager.zip_asset_importer_batch
+    state = bpy.context.window_manager.asset_importer_batch
     queue = _batch_run["queue"]
 
     if state.cancel_requested or not queue:
@@ -932,12 +932,12 @@ def _batch_timer_step_body():
     return _BATCH_STEP_INTERVAL
 
 
-class ZIPASSETIMPORTER_PG_batch_error(PropertyGroup):
+class ASSETIMPORTER_PG_batch_error(PropertyGroup):
     filename: StringProperty(name="Filename")
     message: StringProperty(name="Message")
 
 
-class ZIPASSETIMPORTER_PG_batch_state(PropertyGroup):
+class ASSETIMPORTER_PG_batch_state(PropertyGroup):
     is_running: BoolProperty(default=False)
     cancel_requested: BoolProperty(default=False)
     finished: BoolProperty(default=False)
@@ -950,11 +950,11 @@ class ZIPASSETIMPORTER_PG_batch_state(PropertyGroup):
     start_time: FloatProperty(default=0.0)
     elapsed: FloatProperty(default=0.0)
     show_errors: BoolProperty(default=False)
-    errors: CollectionProperty(type=ZIPASSETIMPORTER_PG_batch_error)
+    errors: CollectionProperty(type=ASSETIMPORTER_PG_batch_error)
 
 
-class ZIPASSETIMPORTER_OT_batch_import(Operator):
-    bl_idname = "zip_asset_importer.batch_import"
+class ASSETIMPORTER_OT_batch_import(Operator):
+    bl_idname = "asset_importer.batch_import"
     bl_label = "Start Batch Import"
     bl_description = (
         "Recursively scan the root folder for .fbx/.glb/.gltf assets and import them one at a time, "
@@ -965,13 +965,13 @@ class ZIPASSETIMPORTER_OT_batch_import(Operator):
     def execute(self, context):
         scene = context.scene
         wm = context.window_manager
-        state = wm.zip_asset_importer_batch
+        state = wm.asset_importer_batch
 
         if state.is_running:
             self.report({"WARNING"}, "A batch import is already running")
             return {"CANCELLED"}
 
-        root = bpy.path.abspath(scene.zip_asset_importer_batch_root)
+        root = bpy.path.abspath(scene.asset_importer_batch_root)
         if not root or not os.path.isdir(root):
             self.report({"ERROR"}, "Choose a valid root folder")
             return {"CANCELLED"}
@@ -979,7 +979,7 @@ class ZIPASSETIMPORTER_OT_batch_import(Operator):
         found, scan_errors = _scan_batch_assets(root)
 
         texture_folders = []
-        if scene.zip_asset_importer_batch_texture_spheres:
+        if scene.asset_importer_batch_texture_spheres:
             texture_folders = _scan_texture_only_folders(root, {path.parent for path in found})
 
         if not found and not texture_folders:
@@ -1028,32 +1028,32 @@ class ZIPASSETIMPORTER_OT_batch_import(Operator):
         _tag_redraw_all()
 
         message = f"Batch import started: {len(found)} model(s)"
-        if scene.zip_asset_importer_batch_texture_spheres:
+        if scene.asset_importer_batch_texture_spheres:
             message += f", {len(texture_folders)} texture-only folder(s)"
         message += " queued"
         self.report({"INFO"}, message)
         return {"FINISHED"}
 
 
-class ZIPASSETIMPORTER_OT_batch_cancel(Operator):
-    bl_idname = "zip_asset_importer.batch_cancel"
+class ASSETIMPORTER_OT_batch_cancel(Operator):
+    bl_idname = "asset_importer.batch_cancel"
     bl_label = "Stop Batch Import"
     bl_description = "Finish the asset currently being processed, then stop the batch cleanly"
     bl_options = {"INTERNAL"}
 
     def execute(self, context):
-        context.window_manager.zip_asset_importer_batch.cancel_requested = True
+        context.window_manager.asset_importer_batch.cancel_requested = True
         return {"FINISHED"}
 
 
-class ZIPASSETIMPORTER_OT_batch_dismiss(Operator):
-    bl_idname = "zip_asset_importer.batch_dismiss"
+class ASSETIMPORTER_OT_batch_dismiss(Operator):
+    bl_idname = "asset_importer.batch_dismiss"
     bl_label = "Dismiss Summary"
     bl_description = "Clear the last batch import summary"
     bl_options = {"INTERNAL"}
 
     def execute(self, context):
-        state = context.window_manager.zip_asset_importer_batch
+        state = context.window_manager.asset_importer_batch
         state.finished = False
         state.cancelled = False
         state.errors.clear()
@@ -1064,15 +1064,15 @@ class ZIPASSETIMPORTER_OT_batch_dismiss(Operator):
         return {"FINISHED"}
 
 
-class ZIPASSETIMPORTER_OT_import_zip(Operator):
-    bl_idname = "zip_asset_importer.import_zip"
+class ASSETIMPORTER_OT_import_zip(Operator):
+    bl_idname = "asset_importer.import_zip"
     bl_label = "Import ZIP Asset"
     bl_description = "Extract the selected ZIP, import its model, and build a Node Wrangler-style material"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         scene = context.scene
-        zip_path = bpy.path.abspath(scene.zip_asset_importer_zip_path)
+        zip_path = bpy.path.abspath(scene.asset_importer_zip_path)
         if not zip_path or not os.path.isfile(zip_path):
             self.report({"ERROR"}, "Choose a valid ZIP file")
             return {"CANCELLED"}
@@ -1088,7 +1088,7 @@ class ZIPASSETIMPORTER_OT_import_zip(Operator):
 
         zip_path = str(organized_zip)
         extract_dir = asset_folder
-        scene.zip_asset_importer_zip_path = zip_path
+        scene.asset_importer_zip_path = zip_path
 
         try:
             _safe_extract(zip_path, extract_dir)
@@ -1102,7 +1102,7 @@ class ZIPASSETIMPORTER_OT_import_zip(Operator):
             self.report({"ERROR"}, "No supported 3D model file found in the ZIP")
             return {"CANCELLED"}
 
-        selected_models = _choose_model_files(model_paths, scene.zip_asset_importer_import_all_models)
+        selected_models = _choose_model_files(model_paths, scene.asset_importer_import_all_models)
         imported_objects = []
         import_errors = []
         for model_path in selected_models:
@@ -1125,15 +1125,15 @@ class ZIPASSETIMPORTER_OT_import_zip(Operator):
             material = _create_node_wrangler_style_material(
                 material_name,
                 texture_matches,
-                scene.zip_asset_importer_use_ao_cavity,
+                scene.asset_importer_use_ao_cavity,
             )
-            _apply_material(mesh_objects, material, scene.zip_asset_importer_replace_materials)
+            _apply_material(mesh_objects, material, scene.asset_importer_replace_materials)
 
-        if scene.zip_asset_importer_shade_smooth:
+        if scene.asset_importer_shade_smooth:
             _shade_smooth(mesh_objects)
 
         _select_objects(imported_objects)
-        if scene.zip_asset_importer_focus_view and getattr(context, "screen", None):
+        if scene.asset_importer_focus_view and getattr(context, "screen", None):
             for area in context.screen.areas:
                 if area.type == "VIEW_3D":
                     region = next((r for r in area.regions if r.type == "WINDOW"), None)
@@ -1153,46 +1153,46 @@ class ZIPASSETIMPORTER_OT_import_zip(Operator):
         return {"FINISHED"}
 
 
-class ZIPASSETIMPORTER_PT_panel(Panel):
-    bl_label = "ZIP Asset Importer"
-    bl_idname = "ZIPASSETIMPORTER_PT_panel"
+class ASSETIMPORTER_PT_panel(Panel):
+    bl_label = "Asset Importer"
+    bl_idname = "ASSETIMPORTER_PT_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "ZIP Import"
+    bl_category = "Asset Importer"
 
     def draw(self, context):
         layout = self.layout
         scene = context.scene
 
         col = layout.column(align=True)
-        col.prop(scene, "zip_asset_importer_zip_path", text="ZIP")
+        col.prop(scene, "asset_importer_zip_path", text="ZIP")
 
         box = layout.box()
-        box.prop(scene, "zip_asset_importer_import_all_models")
-        box.prop(scene, "zip_asset_importer_replace_materials")
-        box.prop(scene, "zip_asset_importer_use_ao_cavity")
-        box.prop(scene, "zip_asset_importer_shade_smooth")
-        box.prop(scene, "zip_asset_importer_focus_view")
+        box.prop(scene, "asset_importer_import_all_models")
+        box.prop(scene, "asset_importer_replace_materials")
+        box.prop(scene, "asset_importer_use_ao_cavity")
+        box.prop(scene, "asset_importer_shade_smooth")
+        box.prop(scene, "asset_importer_focus_view")
 
-        layout.operator("zip_asset_importer.import_zip", icon="IMPORT")
+        layout.operator("asset_importer.import_zip", icon="IMPORT")
 
         layout.separator()
         self._draw_batch_section(layout, context)
 
     def _draw_batch_section(self, layout, context):
         scene = context.scene
-        state = context.window_manager.zip_asset_importer_batch
+        state = context.window_manager.asset_importer_batch
 
         box = layout.box()
         box.label(text="Batch Import (Folder)", icon="FILE_FOLDER")
-        box.prop(scene, "zip_asset_importer_batch_root", text="Root Folder")
+        box.prop(scene, "asset_importer_batch_root", text="Root Folder")
 
-        box.prop(scene, "zip_asset_importer_batch_auto_layout")
-        box.prop(scene, "zip_asset_importer_batch_texture_spheres")
-        if scene.zip_asset_importer_batch_auto_layout or scene.zip_asset_importer_batch_texture_spheres:
+        box.prop(scene, "asset_importer_batch_auto_layout")
+        box.prop(scene, "asset_importer_batch_texture_spheres")
+        if scene.asset_importer_batch_auto_layout or scene.asset_importer_batch_texture_spheres:
             layout_row = box.row(align=True)
-            layout_row.prop(scene, "zip_asset_importer_batch_layout_spacing", text="Spacing")
-            layout_row.prop(scene, "zip_asset_importer_batch_layout_row_width", text="Row Width")
+            layout_row.prop(scene, "asset_importer_batch_layout_spacing", text="Spacing")
+            layout_row.prop(scene, "asset_importer_batch_layout_row_width", text="Row Width")
 
         if state.is_running:
             factor = (state.processed / state.total) if state.total else 0.0
@@ -1205,11 +1205,11 @@ class ZIPASSETIMPORTER_PT_panel(Panel):
             cancel_row = box.row()
             cancel_row.alert = True
             cancel_row.scale_y = 1.3
-            cancel_row.operator("zip_asset_importer.batch_cancel", icon="CANCEL", text="Stop Batch Import")
+            cancel_row.operator("asset_importer.batch_cancel", icon="CANCEL", text="Stop Batch Import")
         else:
             row = box.row()
-            row.enabled = bool(scene.zip_asset_importer_batch_root)
-            row.operator("zip_asset_importer.batch_import", icon="PLAY", text="Start Batch Import")
+            row.enabled = bool(scene.asset_importer_batch_root)
+            row.operator("asset_importer.batch_import", icon="PLAY", text="Start Batch Import")
 
         if state.finished:
             self._draw_batch_summary(box, state)
@@ -1253,17 +1253,17 @@ class ZIPASSETIMPORTER_PT_panel(Panel):
                 if len(state.errors) > 50:
                     issues.label(text=f"... and {len(state.errors) - 50} more")
 
-        summary.operator("zip_asset_importer.batch_dismiss", text="Dismiss")
+        summary.operator("asset_importer.batch_dismiss", text="Dismiss")
 
 
 classes = (
-    ZIPASSETIMPORTER_PG_batch_error,
-    ZIPASSETIMPORTER_PG_batch_state,
-    ZIPASSETIMPORTER_OT_import_zip,
-    ZIPASSETIMPORTER_OT_batch_import,
-    ZIPASSETIMPORTER_OT_batch_cancel,
-    ZIPASSETIMPORTER_OT_batch_dismiss,
-    ZIPASSETIMPORTER_PT_panel,
+    ASSETIMPORTER_PG_batch_error,
+    ASSETIMPORTER_PG_batch_state,
+    ASSETIMPORTER_OT_import_zip,
+    ASSETIMPORTER_OT_batch_import,
+    ASSETIMPORTER_OT_batch_cancel,
+    ASSETIMPORTER_OT_batch_dismiss,
+    ASSETIMPORTER_PT_panel,
 )
 
 
@@ -1271,50 +1271,50 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    bpy.types.Scene.zip_asset_importer_zip_path = StringProperty(
+    bpy.types.Scene.asset_importer_zip_path = StringProperty(
         name="ZIP File",
         description="ZIP archive containing a 3D model and texture maps",
         subtype="FILE_PATH",
         default="",
     )
-    bpy.types.Scene.zip_asset_importer_import_all_models = BoolProperty(
+    bpy.types.Scene.asset_importer_import_all_models = BoolProperty(
         name="Import All Models",
         description="Import every supported model in the ZIP instead of the highest quality candidate",
         default=False,
     )
-    bpy.types.Scene.zip_asset_importer_replace_materials = BoolProperty(
+    bpy.types.Scene.asset_importer_replace_materials = BoolProperty(
         name="Replace Materials",
         description="Replace mesh materials with the generated PBR material",
         default=True,
     )
-    bpy.types.Scene.zip_asset_importer_use_ao_cavity = BoolProperty(
+    bpy.types.Scene.asset_importer_use_ao_cavity = BoolProperty(
         name="Multiply AO/Cavity",
         description="Multiply AO and cavity maps into Base Color in addition to loading them as texture nodes",
         default=True,
     )
-    bpy.types.Scene.zip_asset_importer_shade_smooth = BoolProperty(
+    bpy.types.Scene.asset_importer_shade_smooth = BoolProperty(
         name="Shade Smooth",
         description="Shade imported meshes smooth after import",
         default=True,
     )
-    bpy.types.Scene.zip_asset_importer_focus_view = BoolProperty(
+    bpy.types.Scene.asset_importer_focus_view = BoolProperty(
         name="Frame Imported",
         description="Frame the imported model in the active 3D View",
         default=True,
     )
-    bpy.types.Scene.zip_asset_importer_batch_root = StringProperty(
+    bpy.types.Scene.asset_importer_batch_root = StringProperty(
         name="Batch Root Folder",
         description="Root folder to scan recursively for .fbx/.glb/.gltf assets",
         subtype="DIR_PATH",
         default="",
     )
-    bpy.types.Scene.zip_asset_importer_batch_auto_layout = BoolProperty(
+    bpy.types.Scene.asset_importer_batch_auto_layout = BoolProperty(
         name="Auto-Layout Grid",
         description="Arrange each imported asset on a spaced-out grid (by footprint) so a batch of "
         "assets authored at the same origin doesn't end up stacked on top of each other",
         default=False,
     )
-    bpy.types.Scene.zip_asset_importer_batch_texture_spheres = BoolProperty(
+    bpy.types.Scene.asset_importer_batch_texture_spheres = BoolProperty(
         name="Texture-Only Folders → Spheres",
         description="Also scan for folders that contain texture images but no supported 3D model. For each one, "
         "build a material from the textures and apply it to a new sphere so you can preview it. These spheres are "
@@ -1322,14 +1322,14 @@ def register():
         "preserve",
         default=False,
     )
-    bpy.types.Scene.zip_asset_importer_batch_layout_spacing = FloatProperty(
+    bpy.types.Scene.asset_importer_batch_layout_spacing = FloatProperty(
         name="Spacing",
         description="Gap left between adjacent assets in the auto-layout grid",
         subtype="DISTANCE",
         default=1.0,
         min=0.0,
     )
-    bpy.types.Scene.zip_asset_importer_batch_layout_row_width = FloatProperty(
+    bpy.types.Scene.asset_importer_batch_layout_row_width = FloatProperty(
         name="Row Width",
         description="Approximate width before the auto-layout grid wraps to a new row",
         subtype="DISTANCE",
@@ -1337,7 +1337,7 @@ def register():
         min=0.1,
     )
 
-    bpy.types.WindowManager.zip_asset_importer_batch = PointerProperty(type=ZIPASSETIMPORTER_PG_batch_state)
+    bpy.types.WindowManager.asset_importer_batch = PointerProperty(type=ASSETIMPORTER_PG_batch_state)
 
 
 def unregister():
@@ -1345,21 +1345,21 @@ def unregister():
         bpy.app.timers.unregister(_batch_timer_step)
     _batch_run["queue"].clear()
 
-    if hasattr(bpy.types.WindowManager, "zip_asset_importer_batch"):
-        del bpy.types.WindowManager.zip_asset_importer_batch
+    if hasattr(bpy.types.WindowManager, "asset_importer_batch"):
+        del bpy.types.WindowManager.asset_importer_batch
 
     for prop_name in (
-        "zip_asset_importer_zip_path",
-        "zip_asset_importer_import_all_models",
-        "zip_asset_importer_replace_materials",
-        "zip_asset_importer_use_ao_cavity",
-        "zip_asset_importer_shade_smooth",
-        "zip_asset_importer_focus_view",
-        "zip_asset_importer_batch_root",
-        "zip_asset_importer_batch_auto_layout",
-        "zip_asset_importer_batch_texture_spheres",
-        "zip_asset_importer_batch_layout_spacing",
-        "zip_asset_importer_batch_layout_row_width",
+        "asset_importer_zip_path",
+        "asset_importer_import_all_models",
+        "asset_importer_replace_materials",
+        "asset_importer_use_ao_cavity",
+        "asset_importer_shade_smooth",
+        "asset_importer_focus_view",
+        "asset_importer_batch_root",
+        "asset_importer_batch_auto_layout",
+        "asset_importer_batch_texture_spheres",
+        "asset_importer_batch_layout_spacing",
+        "asset_importer_batch_layout_row_width",
     ):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)
